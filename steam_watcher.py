@@ -32,6 +32,7 @@ APP_DIR = get_app_dir()
 CONFIG_PATH = os.path.join(APP_DIR, "config.json")
 CACHE_PATH = os.path.join(APP_DIR, "achievements_cache.json")
 IMAGE_CACHE_PATH = os.path.join(APP_DIR, "image_cache.db")
+VIEWER_REFRESH_CALLBACK = None
 
 # ==============================================================================
 # DEFAULTS
@@ -127,15 +128,16 @@ def save_cache(data):
     except Exception as e:
         log(f"❌ Cache save failed: {e}")
 
+
 def init_image_cache():
     try:
         conn = sqlite3.connect(IMAGE_CACHE_PATH)
         c = conn.cursor()
-        c.execute('''CREATE TABLE IF NOT EXISTS images (
+        c.execute("""CREATE TABLE IF NOT EXISTS images (
             url TEXT PRIMARY KEY,
             data BLOB,
             timestamp INTEGER
-        )''')
+        )""")
         conn.commit()
         conn.close()
     except Exception as e:
@@ -166,8 +168,6 @@ def save_image_to_cache(url, data):
         conn.close()
     except Exception:
         pass
-
-
 
 
 def get_resource_path(relative_path):
@@ -414,6 +414,9 @@ def check_achievements(app_id):
                     log(f"  🏆 NEW: {clean_name} in {game_name}")
                     show_toast(CONFIG["toast"]["ach_title"], game_name, clean_name, icon_url)
                     new_unlocks += 1
+                    # Trigger viewer refresh
+                    if VIEWER_REFRESH_CALLBACK:
+                        VIEWER_REFRESH_CALLBACK()
 
                 LAST_UNLOCKED.add(ach_id)
 
@@ -481,6 +484,8 @@ def watcher_loop():
 # ACHIEVEMENT VIEWER
 # ==============================================================================
 def open_achievements_viewer(root):
+    global VIEWER_REFRESH_CALLBACK
+
     win = tk.Toplevel(root)
     win.title("Achievement Viewer")
     win.configure(bg="#1b2838")
@@ -517,92 +522,70 @@ def open_achievements_viewer(root):
                         bg="#1b2838", fg="#66c0f4")
     progress.pack(pady=4)
 
-    # Scrollable container
+    # Scrollable container — tk.Text handles scrolling natively
     outer = tk.Frame(win, bg="#1b2838")
     outer.pack(fill="both", expand=True, padx=12, pady=(0, 12))
 
-    canvas = tk.Canvas(outer, bg="#1b2838", highlightthickness=0)
-    scrollbar = tk.Scrollbar(outer, orient="vertical", command=canvas.yview)
-    scroll_frame = tk.Frame(canvas, bg="#1b2838")
-
-    def refresh_scrollregion():
-        def _do():
-            scroll_frame.update_idletasks()
-            h = scroll_frame.winfo_reqheight()
-            w = max(scroll_frame.winfo_reqwidth(), canvas.winfo_width())
-            if h > 0:
-                canvas.configure(scrollregion=(0, 0, w, h))
-        canvas.after_idle(_do)
-
-    scroll_frame.bind("<Configure>", lambda e: refresh_scrollregion())
-    inner_id = canvas.create_window((0, 0), window=scroll_frame, anchor="nw")
-    canvas.configure(yscrollcommand=scrollbar.set)
-
-    def on_canvas_configure(event):
-        canvas.itemconfig(inner_id, width=event.width)
-        refresh_scrollregion()
-    canvas.bind("<Configure>", on_canvas_configure)
-
-    canvas.pack(side="left", fill="both", expand=True)
+    scrollbar = tk.Scrollbar(outer, orient="vertical")
     scrollbar.pack(side="right", fill="y")
-    canvas.configure(scrollregion=(0, 0, 0, 0))
+
+    text_widget = tk.Text(outer, bg="#1b2838", fg="#c7d5e0",
+                          font=("Helvetica", 10), wrap="word",
+                          state="disabled", padx=0, pady=0,
+                          highlightthickness=0, borderwidth=0,
+                          yscrollcommand=scrollbar.set)
+    text_widget.pack(side="left", fill="both", expand=True)
+    scrollbar.config(command=text_widget.yview)
 
     # Mouse wheel
     def on_mousewheel(event):
         if platform.system() == "Darwin":
-            canvas.yview_scroll(int(-1 * event.delta), "units")
+            text_widget.yview_scroll(int(-1 * event.delta), "units")
         else:
-            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+            text_widget.yview_scroll(int(-1 * (event.delta / 120)), "units")
 
-    canvas.bind("<Enter>", lambda e: canvas.bind_all("<MouseWheel>", on_mousewheel))
-    canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
+    text_widget.bind("<Enter>", lambda e: text_widget.bind_all("<MouseWheel>", on_mousewheel))
+    text_widget.bind("<Leave>", lambda e: text_widget.unbind_all("<MouseWheel>"))
+
+    # Arrow key scrolling
+    def scroll_up(event):
+        text_widget.yview_scroll(-1, "units")
+        return "break"
+
+    def scroll_down(event):
+        text_widget.yview_scroll(1, "units")
+        return "break"
+
+    def scroll_page_up(event):
+        text_widget.yview_scroll(-1, "pages")
+        return "break"
+
+    def scroll_page_down(event):
+        text_widget.yview_scroll(1, "pages")
+        return "break"
+
+    text_widget.bind("<Up>", scroll_up)
+    text_widget.bind("<Down>", scroll_down)
+    text_widget.bind("<Prior>", scroll_page_up)
+    text_widget.bind("<Next>", scroll_page_down)
+    text_widget.focus_set()
 
     # Data structures
     viewer_queue = queue.Queue()
-    game_widgets = []          # [(lowercase_name, frame_widget, banner_label)]
-    banner_photos = {}         # {app_id: PhotoImage}
+    game_data = []          # list of game dicts
+    banner_photos = {}      # {app_id: PhotoImage}
+    expanded_state = {}     # {app_id: bool}
+    _search_timer = [None]
 
-    def filter_games(*args):
-        text = search_var.get().lower().strip()
-        for name, frame, _ in game_widgets:
-            if text in name:
-                frame.pack(fill="x", pady=6)
-            else:
-                frame.pack_forget()
-        refresh_scrollregion()
-
-    search_var.trace_add("write", filter_games)
-
-    def update_banner(app_id, bytes_data):
-        if not HAS_PILLOW:
-            return
-        try:
-            img = Image.open(io.BytesIO(bytes_data))
-            w, h = img.size
-            target_w = 520
-            target_h = int(h * (target_w / w))
-            img = img.resize((target_w, target_h), Image.LANCZOS)
-            photo = ImageTk.PhotoImage(img)
-            banner_photos[app_id] = photo
-
-            for _, frame, bl in game_widgets:
-                if getattr(bl, "_app_id", None) == app_id:
-                    bl.config(image=photo, text="", bg="#1b2838")
-                    bl.image = photo
-                    break
-            refresh_scrollregion()
-        except Exception:
-            pass
-
-    def add_game_to_ui(game):
+    def build_game_ui(game):
+        """Create a game frame and return it."""
         app_id = game["app_id"]
         game_name = game["name"]
         achievements = game["achievements"]
         unlocked = game["unlocked_count"]
         total = game["total_count"]
 
-        frame = tk.Frame(scroll_frame, bg="#1b2838")
-        frame.pack(fill="x", pady=6)
+        frame = tk.Frame(text_widget, bg="#1b2838")
 
         # Banner (clickable)
         banner_label = tk.Label(frame, bg="#16202d", cursor="hand2",
@@ -610,6 +593,11 @@ def open_achievements_viewer(root):
                                 font=("Helvetica", 10, "bold"))
         banner_label._app_id = app_id
         banner_label.pack(fill="x")
+
+        # Apply cached banner if already loaded
+        if app_id in banner_photos:
+            banner_label.config(image=banner_photos[app_id], text="", bg="#1b2838")
+            banner_label.image = banner_photos[app_id]
 
         # Info bar
         info = tk.Frame(frame, bg="#2a475e", padx=10, pady=5)
@@ -627,13 +615,11 @@ def open_achievements_viewer(root):
                        font=("Helvetica", 10, "bold"), cursor="hand2")
         ind.pack(side="right", padx=(0, 8))
 
-        # Expandable content — EMPTY until first click
+        # Expandable content
         content = tk.Frame(frame, bg="#1b2838")
-        expanded = [False]
         populated = [False]
 
         def populate():
-            """Build achievement rows only once, on first expand."""
             if populated[0]:
                 return
             populated[0] = True
@@ -698,8 +684,11 @@ def open_achievements_viewer(root):
                 tk.Frame(content, height=1, bg="#3d4450").pack(fill="x", padx=4)
 
         def toggle():
-            expanded[0] = not expanded[0]
-            if expanded[0]:
+            is_expanded = expanded_state.get(app_id, False)
+            is_expanded = not is_expanded
+            expanded_state[app_id] = is_expanded
+
+            if is_expanded:
                 populate()
                 content.pack(fill="x", padx=8, pady=(0, 10))
                 ind.config(text="▼")
@@ -715,37 +704,79 @@ def open_achievements_viewer(root):
                         w.config(bg="#2a475e", fg="#ffffff")
                     else:
                         w.config(bg="#2a475e", fg="#66c0f4")
-            refresh_scrollregion()
 
         banner_label.bind("<Button-1>", lambda e: toggle())
         info.bind("<Button-1>", lambda e: toggle())
         ind.bind("<Button-1>", lambda e: toggle())
 
-        game_widgets.append((game_name.lower(), frame, banner_label))
-        refresh_scrollregion()
+        # Restore expanded state if previously expanded
+        if expanded_state.get(app_id, False):
+            toggle()
 
-    def render_from_cache():
-        cache = load_cache()
-        if cache and cache.get("games"):
-            games = cache["games"]
-            progress.config(text=f"Loaded {len(games)} games from cache.")
+        return frame
 
-            def stream(i=0):
-                if i >= len(games):
-                    progress.config(text="✅ Ready. Click a banner to expand.")
-                    threading.Thread(target=fetch_banners_background,
-                                     args=(games, viewer_queue), daemon=True).start()
-                    refresh_scrollregion()
-                    return
-                add_game_to_ui(games[i])
-                if i % 10 == 0:
-                    win.update_idletasks()
-                    refresh_scrollregion()
-                win.after(1, stream, i + 1)
+    def render_games(games_list):
+        """Rebuild the text widget with the given games."""
+        text_widget.config(state="normal")
+        # Destroy old embedded frames to prevent leaks
+        for child in list(text_widget.winfo_children()):
+            child.destroy()
+        text_widget.delete("1.0", "end")
 
-            stream()
-            return True
-        return False
+        for game in games_list:
+            frame = build_game_ui(game)
+            text_widget.window_create("end", window=frame)
+            text_widget.insert("end", "\n")
+
+        text_widget.config(state="disabled")
+
+    def filter_games(*args):
+        if _search_timer[0]:
+            win.after_cancel(_search_timer[0])
+
+        def _do():
+            _search_timer[0] = None
+            text = search_var.get().lower().strip()
+            if not text:
+                render_games(game_data)
+                return
+            filtered = [g for g in game_data if text in g["name"].lower()]
+            render_games(filtered)
+
+        _search_timer[0] = win.after(150, _do)
+
+    search_var.trace_add("write", filter_games)
+
+    def update_banner(app_id, bytes_data):
+        if not HAS_PILLOW:
+            return
+        try:
+            img = Image.open(io.BytesIO(bytes_data))
+            w, h = img.size
+            target_w = 520
+            target_h = int(h * (target_w / w))
+            img = img.resize((target_w, target_h), Image.LANCZOS)
+            photo = ImageTk.PhotoImage(img)
+            banner_photos[app_id] = photo
+
+            # Find all banner labels with this app_id and update them
+            for child in text_widget.winfo_children():
+                for sub in child.winfo_children():
+                    if isinstance(sub, tk.Label) and getattr(sub, "_app_id", None) == app_id:
+                        sub.config(image=photo, text="", bg="#1b2838")
+                        sub.image = photo
+                        break
+        except Exception:
+            pass
+
+    def load_games(games):
+        nonlocal game_data
+        game_data = games
+        render_games(game_data)
+
+        # Fetch banners in background
+        threading.Thread(target=fetch_banners_background,
+                         args=(games, viewer_queue), daemon=True).start()
 
     def fetch_banners_background(games, q):
         for g in games:
@@ -765,11 +796,16 @@ def open_achievements_viewer(root):
         q.put(("banners_done",))
 
     def full_resync():
-        # Clear UI
-        for _, frame, _ in game_widgets:
-            frame.destroy()
-        game_widgets.clear()
+        nonlocal game_data
+        game_data = []
+        expanded_state.clear()
         banner_photos.clear()
+
+        text_widget.config(state="normal")
+        for child in list(text_widget.winfo_children()):
+            child.destroy()
+        text_widget.delete("1.0", "end")
+        text_widget.config(state="disabled")
 
         progress.config(text="Resyncing full library from Steam...")
         resync_btn.config(state="disabled")
@@ -784,7 +820,6 @@ def open_achievements_viewer(root):
                 for idx, app_id in enumerate(owned, 1):
                     viewer_queue.put(("progress", idx, total))
                     try:
-                        # Schema
                         s_url = "https://api.steampowered.com/ISteamUserStats/GetSchemaForGame/v2/"
                         s_res = requests.get(s_url, params={
                             "key": CONFIG["api_key"], "appid": app_id, "format": "json"
@@ -795,7 +830,6 @@ def open_achievements_viewer(root):
                         if not schema_achs:
                             continue
 
-                        # Player
                         p_url = "https://api.steampowered.com/ISteamUserStats/GetPlayerAchievements/v1/"
                         p_res = requests.get(p_url, params={
                             "key": CONFIG["api_key"], "steamid": CONFIG["steam_id"],
@@ -832,7 +866,6 @@ def open_achievements_viewer(root):
                     except Exception:
                         continue
 
-                # Sort alphabetically
                 games.sort(key=lambda x: x["name"].lower())
                 save_cache({"last_sync": int(time.time()), "games": games})
                 viewer_queue.put(("complete", games))
@@ -860,22 +893,9 @@ def open_achievements_viewer(root):
 
                 elif cmd == "complete":
                     _, games = msg
-
-                    def stream(i=0):
-                        if i >= len(games):
-                            progress.config(text=f"✅ Synced {len(games)} games. Cached.")
-                            resync_btn.config(state="normal")
-                            threading.Thread(target=fetch_banners_background,
-                                             args=(games, viewer_queue), daemon=True).start()
-                            refresh_scrollregion()
-                            return
-                        add_game_to_ui(games[i])
-                        if i % 5 == 0:
-                            win.update_idletasks()
-                            refresh_scrollregion()
-                        win.after(1, stream, i + 1)
-
-                    stream()
+                    progress.config(text=f"✅ Synced {len(games)} games. Cached.")
+                    resync_btn.config(state="normal")
+                    load_games(games)
 
                 elif cmd == "error":
                     _, err = msg
@@ -886,16 +906,38 @@ def open_achievements_viewer(root):
             pass
         win.after(200, poll_viewer_queue)
 
-    # Wire up resync button
+    def refresh_viewer():
+        """Called when a new achievement is unlocked. Reloads from cache."""
+        cache = load_cache()
+        if cache and cache.get("games"):
+            nonlocal game_data
+            game_data = cache["games"]
+            # Preserve expanded state, just re-render
+            render_games(game_data)
+            progress.config(text="🔄 Viewer refreshed — new achievement detected!")
+            win.after(3000, lambda: progress.config(text="✅ Ready. Click a banner to expand."))
+
+    # Register refresh callback
+    VIEWER_REFRESH_CALLBACK = refresh_viewer
+
+    def on_close():
+        global VIEWER_REFRESH_CALLBACK
+        VIEWER_REFRESH_CALLBACK = None
+        win.destroy()
+
+    win.protocol("WM_DELETE_WINDOW", on_close)
+
     resync_btn.config(command=full_resync)
 
     # Start
-    if not render_from_cache():
+    cache = load_cache()
+    if cache and cache.get("games"):
+        progress.config(text=f"Loaded {len(cache['games'])} games from cache.")
+        load_games(cache["games"])
+    else:
         full_resync()
 
     poll_viewer_queue()
-
-
 # ==============================================================================
 # FIRST-RUN SETUP
 # ==============================================================================
